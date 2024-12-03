@@ -1,147 +1,111 @@
 import socket
-import random
-import pickle
 import threading
+import pickle
+import random
 import time
 
-# Variables globales
-turno_event = threading.Event()  # Event to manage turn synchronization
-turno_event.set()  # Set the first player as the one who can start
-jugadores = []  # List to keep track of the players
-tablero_global = []
-minas_pos = []
-dificultad = ""
-pool_size = 0
+class MinesweeperServer:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(5)
+        self.clients = []
+        self.board = []
+        self.mines = set()
+        self.current_turn = 0
+        self.num_players = 0
+        self.turn_event = threading.Event()
+        self.game_started = False
 
-def generar_tablero(dificultad):
-    filas, columnas, minas = (9, 9, 10) if dificultad == 'principiante' else (16, 16, 40)
-    tablero = [['_' for _ in range(columnas)] for _ in range(filas)]
-    minas_pos = set()
+    def generate_board(self, difficulty):
+        if difficulty == "principiante":
+            rows, cols, num_mines = 9, 9, 10
+        elif difficulty == "avanzado":
+            rows, cols, num_mines = 16, 16, 40
+        else:
+            rows, cols, num_mines = 9, 9, 10  # Default to beginner
 
-    while len(minas_pos) < minas:
-        mina_fila = random.randint(0, filas - 1)
-        mina_columna = random.randint(0, columnas - 1)
-        minas_pos.add((mina_fila, mina_columna))
+        self.board = [['_' for _ in range(cols)] for _ in range(rows)]
+        while len(self.mines) < num_mines:
+            mine = (random.randint(0, rows - 1), random.randint(0, cols - 1))
+            self.mines.add(mine)
 
-    return tablero, minas_pos
+    def broadcast(self, message):
+        for client_socket, _ in self.clients:
+            client_socket.send(message.encode())
 
-def manejar_cliente(conexion, direccion, jugador_id):
-    global tablero_global, dificultad, pool_size
-    print(f"Jugador {jugador_id} conectado desde {direccion}")
-    
-    # Indicar si es el primer jugador
-    if jugador_id == 0:
-        conexion.send("0".encode())  # Primer jugador
-    else:
-        conexion.send("1".encode())  # No es el primer jugador
-    
-    # El primer jugador configura el juego
-    if jugador_id == 0:
-        dificultad = conexion.recv(1024).decode().lower()
-        conexion.send(f"Seleccionaste dificultad: {dificultad}".encode())
-        
-        pool_size = int(conexion.recv(1024).decode())
-        conexion.send(f"El POOL es de {pool_size} jugadores.".encode())
-        
-        # Generar el tablero
-        tablero_global, minas_pos = generar_tablero(dificultad)
-    
-    else:
-        # El segundo jugador recibe la dificultad del servidor
-        conexion.send(dificultad.encode())
-    
-    # Confirmar que la configuración ha terminado
-    conexion.send("Configuración completada. Esperando al siguiente turno.".encode())
+    def broadcast_board(self):
+        board_data = pickle.dumps(self.board)  # Serialize the board
+        for client_socket, _ in self.clients:
+            client_socket.send(board_data)  # Send the serialized board
 
-    # Esperar hasta que sea el turno del jugador
-    turno_event.wait()
+    def pass_turn(self):
+        self.current_turn = (self.current_turn + 1) % self.num_players
+        self.turn_event.set()
 
-    coordenadas_seleccionadas = set()
-    conexion.send("Tablero listo. Comienza el juego.".encode())
+    def handle_client(self, client_socket, player_id):
+        if player_id == 0:
+            # Primer jugador: configura el juego
+            client_socket.send("Elige la dificultad (principiante/avanzado): ".encode())
+            difficulty = client_socket.recv(1024).decode()
+            self.generate_board(difficulty)
 
-    inicio = time.time()
+            client_socket.send("Elige el número de jugadores: ".encode())
+            self.num_players = int(client_socket.recv(1024).decode())
 
-    while True:
-        try:
-            # Intentar recibir los datos correctamente
-            data = conexion.recv(4096)
-            if not data:
-                print(f"Conexión cerrada por el jugador {jugador_id}")
-                break  # Si no se reciben datos, cerrar la conexión
+            self.broadcast("Esperando que todos los jugadores se conecten...")
 
+        # Espera hasta que todos los jugadores se conecten
+        while len(self.clients) < self.num_players:
+            time.sleep(1)
+
+        if not self.game_started:
+            self.broadcast("¡El juego ha comenzado!")
+            self.game_started = True
+            self.turn_event.set()
+            self.broadcast_board()  # Send the board after game starts
+
+        # Ciclo principal del juego para cada jugador
+        while True:
+            self.turn_event.wait()
+
+            if self.current_turn != player_id:
+                continue
+
+            client_socket.send("Es tu turno. Da las coordenadas (número, letra): ".encode())
             try:
-                fila, columna = pickle.loads(data)  # Deserializar los datos
+                fila, columna = pickle.loads(client_socket.recv(1024))
+                print(f"Jugador {player_id + 1} jugó: ({fila}, {columna})")
+            except Exception:
+                client_socket.send("Error en las coordenadas.".encode())
+                continue
 
-                # Verificar si las coordenadas ya fueron seleccionadas
-                if (fila, columna) in coordenadas_seleccionadas:
-                    conexion.send("coordenada ya seleccionada".encode())
-                    continue  # Continuar esperando nuevas coordenadas
+            if (fila, columna) in self.mines:
+                for mine_row, mine_col in self.mines:
+                    self.board[mine_row][mine_col] = "X"
+                self.broadcast("¡Un jugador ha pisado una mina! Juego terminado.")
+                self.broadcast_board()
+                break
+            else:
+                self.board[fila][columna] = "0"
+                client_socket.send("Tablero actualizado".encode())
+                self.broadcast_board()
 
-                # Marcar la coordenada como seleccionada
-                coordenadas_seleccionadas.add((fila, columna))
+            self.pass_turn()
 
-                # Verificar si la coordenada pisó una mina
-                if (fila, columna) in minas_pos:
-                    # Revelar todas las minas
-                    for mina_fila, mina_columna in minas_pos:
-                        tablero_global[mina_fila][mina_columna] = "1"
-                    
-                    # Enviar mensaje de que se pisó una mina
-                    conexion.send("mina pisada".encode())
-                    conexion.send(pickle.dumps(tablero_global))  # Enviar tablero con minas reveladas
-                    fin = time.time()
-                    duracion = fin - inicio  
-                    conexion.send(pickle.dumps(duracion))
-                    break  # Terminar el juego
-
-                else:
-                    conexion.send("casilla libre".encode())
-                    # Actualizar el tablero
-                    tablero_global[fila][columna] = "0"
-                    conexion.send(pickle.dumps(tablero_global))  # Enviar tablero actualizado
-
-                # Verificar si ha ganado
-                if all(tablero_global[fila][columna] != '_' for fila in range(len(tablero_global)) for columna in range(len(tablero_global[0])) if (fila, columna) not in minas_pos):
-                    conexion.send("ganaste".encode())
-                    break
-
-                # Cambiar de turno
-                if jugador_id == len(jugadores) - 1:
-                    turno_event.clear()  # Bloquear el turno
-                else:
-                    jugadores[jugador_id + 1].set()  # Permitir el turno del siguiente jugador
-
-            except pickle.UnpicklingError as e:
-                print(f"Error al deserializar los datos: {e}")
-                conexion.send("Error al procesar tus coordenadas. Intenta nuevamente.".encode())
-                continue  # Volver a esperar por coordenadas válidas
-
-        except Exception as e:
-            print(f"Error al recibir los datos del jugador: {e}")
-            break  # En caso de error, salir del bucle
-
-    # Calcular y enviar la duración al final
-    fin = time.time()
-    duracion = fin - inicio
-    print(f"Duración del juego: {duracion:.2f} segundos")
-    conexion.send(pickle.dumps(duracion))
-    conexion.close()
-
-def iniciar_servidor():
-    ip = "192.168.1.78"
-    puerto = 54321
-    servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    servidor.bind((ip, puerto))
-    servidor.listen(pool_size)
-    print("Esperando conexiones...")
-
-    jugador_id = 0
-    while True:
-        conexion, direccion = servidor.accept()
-        jugador_event = threading.Event()
-        jugadores.append(jugador_event)
-        threading.Thread(target=manejar_cliente, args=(conexion, direccion, jugador_id)).start()
-        jugador_id += 1
+    def start(self):
+        print("Servidor iniciado. Esperando conexiones...")
+        while True:
+            client_socket, client_address = self.server_socket.accept()
+            print(f"Conexión aceptada desde {client_address}")
+            player_id = len(self.clients)
+            self.clients.append((client_socket, client_address))
+            threading.Thread(target=self.handle_client, args=(client_socket, player_id)).start()
 
 if __name__ == "__main__":
-    iniciar_servidor()
+    host = "192.168.56.1"  # Cambia a la IP adecuada
+    port = 54321
+    server = MinesweeperServer(host, port)
+    server.start()
